@@ -33,6 +33,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
@@ -122,11 +123,34 @@ class DeleteFileIndex {
     return forDataFile(entry.dataSequenceNumber(), entry.file());
   }
 
+  // add all the equality delete files generated in the current snapshot
+  DeleteFile[] forEmptyDataFile() {
+    Stream<DeleteFile> matchingDeletes = Stream.empty();
+    if (globalDeletes != null) {
+      matchingDeletes = Arrays.stream(globalDeletes);
+    }
+
+    if (sortedDeletesByPartition != null) {
+      for (Pair<long[], DeleteFile[]> val : sortedDeletesByPartition.values()) {
+        matchingDeletes =
+            Stream.concat(matchingDeletes, Arrays.stream(val.second()))
+                .filter(deleteFile -> deleteFile.content().equals(FileContent.EQUALITY_DELETES));
+      }
+    }
+
+    return matchingDeletes.toArray(DeleteFile[]::new);
+  }
+
   DeleteFile[] forDataFile(long sequenceNumber, DataFile file) {
+    Stream<DeleteFile> matchingDeletes;
+    // check if the file is a constructed empty file
+    if (file.recordCount() == 0) {
+      return forEmptyDataFile();
+    }
+
     Pair<Integer, StructLikeWrapper> partition = partition(file.specId(), file.partition());
     Pair<long[], DeleteFile[]> partitionDeletes = sortedDeletesByPartition.get(partition);
 
-    Stream<DeleteFile> matchingDeletes;
     if (partitionDeletes == null) {
       matchingDeletes = limitBySequenceNumber(sequenceNumber, globalSeqs, globalDeletes);
     } else if (globalDeletes == null) {
@@ -351,7 +375,17 @@ class DeleteFileIndex {
   }
 
   static Builder builderFor(FileIO io, Iterable<ManifestFile> deleteManifests) {
-    return new Builder(io, Sets.newHashSet(deleteManifests));
+    // 在调用 builderFor 之前检查 deleteManifests
+    System.out.println("Size of deleteManifests1: " + deleteManifests.iterator().hasNext());
+    for (ManifestFile manifest : deleteManifests) {
+      System.out.println("Iterable manifest:" + manifest);
+    }
+    System.out.println("Size of deleteManifests2: " + deleteManifests.iterator().hasNext());
+
+    Builder builder = new Builder(io, Sets.newHashSet(deleteManifests));
+    System.out.println("Size of deleteManifests3: " + deleteManifests.iterator().hasNext());
+
+    return builder;
   }
 
   static class Builder {

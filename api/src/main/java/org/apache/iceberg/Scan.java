@@ -77,6 +77,21 @@ public interface Scan<ThisT, T extends ScanTask, G extends ScanTaskGroup<T>> {
   ThisT includeColumnStats();
 
   /**
+   * Create a new {@link TableScan} from this, used in incremental changLog scan
+   *
+   * @param streaming whether it is a streaming scan
+   * @return a new streaming scan
+   */
+  ThisT streaming(boolean streaming);
+
+  /**
+   * Returns whether this is a streaming scan {@link #isStreaming()} (boolean)}.
+   *
+   * @return true if it is a streaming scan, false otherwise.
+   */
+  boolean isStreaming();
+
+  /**
    * Create a new scan from this that will read the given data columns. This produces an expected
    * schema that includes all fields that are either selected or used by this scan's filter
    * expression.

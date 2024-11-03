@@ -23,7 +23,6 @@ import com.github.benmanes.caffeine.cache.LoadingCache;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.function.BiFunction;
 import java.util.function.Predicate;
@@ -39,15 +38,17 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.metrics.ScanMetrics;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ParallelIterable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 class ManifestGroup {
   private static final Types.StructType EMPTY_STRUCT = Types.StructType.of();
+  private static final Logger LOG = LoggerFactory.getLogger(ManifestGroup.class);
 
   private final FileIO io;
-  private final Set<ManifestFile> dataManifests;
+  private final List<ManifestFile> dataManifests;
   private final DeleteFileIndex.Builder deleteIndexBuilder;
   private Predicate<ManifestFile> manifestPredicate;
   private Predicate<ManifestEntry<DataFile>> manifestEntryPredicate;
@@ -60,6 +61,8 @@ class ManifestGroup {
   private boolean ignoreResiduals;
   private List<String> columns;
   private boolean caseSensitive;
+  private boolean streaming;
+  private Table table;
   private ExecutorService executorService;
   private ScanMetrics scanMetrics;
 
@@ -73,7 +76,7 @@ class ManifestGroup {
   ManifestGroup(
       FileIO io, Iterable<ManifestFile> dataManifests, Iterable<ManifestFile> deleteManifests) {
     this.io = io;
-    this.dataManifests = Sets.newHashSet(dataManifests);
+    this.dataManifests = Lists.newArrayList(dataManifests);
     this.deleteIndexBuilder = DeleteFileIndex.builderFor(io, deleteManifests);
     this.dataFilter = Expressions.alwaysTrue();
     this.fileFilter = Expressions.alwaysTrue();
@@ -85,6 +88,7 @@ class ManifestGroup {
     this.caseSensitive = true;
     this.manifestPredicate = m -> true;
     this.manifestEntryPredicate = e -> true;
+    this.streaming = false;
     this.scanMetrics = ScanMetrics.noop();
   }
 
@@ -153,6 +157,58 @@ class ManifestGroup {
     return this;
   }
 
+  ManifestGroup streaming(boolean newStreaming) {
+    this.streaming = newStreaming;
+    return this;
+  }
+
+  ManifestGroup table(Table tab) {
+    this.table = tab;
+    return this;
+  }
+
+  private void addTmpManifestFile() {
+    if (streaming) {
+      // use a tmpManifest to construct fileScanTask which contains equality delete files only
+      ManifestFile tmpManifest = tmpManifestFile();
+      // place the constructed manifest at first to ensure this task always emit first
+      dataManifests.add(0, tmpManifest);
+    }
+    return;
+  }
+
+  private ManifestFile tmpManifestFile() {
+    PartitionSpec spec = table.spec();
+    Snapshot currentSnapshot = table.currentSnapshot();
+    return new GenericManifestFile(
+        "tmpManifest.avro",
+        1,
+        spec.specId(),
+        ManifestContent.DATA,
+        currentSnapshot.sequenceNumber(),
+        -1,
+        currentSnapshot.snapshotId(),
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        null,
+        null);
+  }
+
+  private DataFile tmpDataFile() {
+    PartitionSpec spec = table.spec();
+    DataFile tmpFile =
+        DataFiles.builder(spec)
+            .withPath("tmpData.parquet")
+            .withFileSizeInBytes(1)
+            .withRecordCount(0)
+            .build();
+    return tmpFile;
+  }
+
   ManifestGroup planWith(ExecutorService newExecutorService) {
     this.executorService = newExecutorService;
     deleteIndexBuilder.planWith(newExecutorService);
@@ -180,7 +236,11 @@ class ManifestGroup {
                 });
 
     DeleteFileIndex deleteFiles = deleteIndexBuilder.scanMetrics(scanMetrics).build();
-
+    if (streaming && deleteFiles.forEmptyDataFile().length == 0) {
+      // no equality delete files in the current snapshot
+      LOG.info("no deleteFiles.");
+      streaming = false;
+    }
     boolean dropStats = ManifestReader.dropStats(columns);
     if (!deleteFiles.isEmpty()) {
       select(ManifestReader.withStatsColumns(columns));
@@ -222,6 +282,16 @@ class ManifestGroup {
     return CloseableIterable.concat(entries((manifest, entries) -> entries));
   }
 
+  private Evaluator getFileEvaluator() {
+    Evaluator evaluator;
+    if (fileFilter != null && fileFilter != Expressions.alwaysTrue()) {
+      evaluator = new Evaluator(DataFile.getType(EMPTY_STRUCT), fileFilter, caseSensitive);
+    } else {
+      evaluator = null;
+    }
+    return evaluator;
+  }
+
   private <T> Iterable<CloseableIterable<T>> entries(
       BiFunction<ManifestFile, CloseableIterable<ManifestEntry<DataFile>>, CloseableIterable<T>>
           entryFn) {
@@ -240,12 +310,8 @@ class ManifestGroup {
                           caseSensitive);
                     });
 
-    Evaluator evaluator;
-    if (fileFilter != null && fileFilter != Expressions.alwaysTrue()) {
-      evaluator = new Evaluator(DataFile.getType(EMPTY_STRUCT), fileFilter, caseSensitive);
-    } else {
-      evaluator = null;
-    }
+    Evaluator evaluator = getFileEvaluator();
+    addTmpManifestFile();
 
     CloseableIterable<ManifestFile> closeableDataManifests =
         CloseableIterable.withNoopClose(dataManifests);
@@ -293,43 +359,46 @@ class ManifestGroup {
 
               @Override
               public CloseableIterator<T> iterator() {
-                ManifestReader<DataFile> reader =
-                    ManifestFiles.read(manifest, io, specsById)
-                        .filterRows(dataFilter)
-                        .filterPartitions(partitionFilter)
-                        .caseSensitive(caseSensitive)
-                        .select(columns)
-                        .scanMetrics(scanMetrics);
 
                 CloseableIterable<ManifestEntry<DataFile>> entries;
-                if (ignoreDeleted) {
-                  entries = reader.liveEntries();
+
+                if (streaming && manifest.addedRowsCount() == 0) {
+                  GenericManifestEntry<DataFile> tmpManifestEntry =
+                      new GenericManifestEntry<>(table.spec().partitionType());
+                  tmpManifestEntry.wrapAppend(
+                      table.currentSnapshot().snapshotId(),
+                      table.currentSnapshot().sequenceNumber(),
+                      tmpDataFile());
+                  entries = CloseableIterable.withNoopClose(tmpManifestEntry);
                 } else {
+                  ManifestReader<DataFile> reader =
+                      ManifestFiles.read(manifest, io, specsById)
+                          .filterRows(dataFilter)
+                          .filterPartitions(partitionFilter)
+                          .caseSensitive(caseSensitive)
+                          .select(columns);
+
                   entries = reader.entries();
-                }
+                  if (ignoreDeleted) {
+                    entries = reader.liveEntries();
+                  }
 
-                if (ignoreExisting) {
-                  entries =
-                      CloseableIterable.filter(
-                          scanMetrics.skippedDataFiles(),
-                          entries,
-                          entry -> entry.status() != ManifestEntry.Status.EXISTING);
-                }
+                  if (ignoreExisting) {
+                    entries =
+                        CloseableIterable.filter(
+                            entries, entry -> entry.status() != ManifestEntry.Status.EXISTING);
+                  }
 
-                if (evaluator != null) {
-                  entries =
-                      CloseableIterable.filter(
-                          scanMetrics.skippedDataFiles(),
-                          entries,
-                          entry -> evaluator.eval((GenericDataFile) entry.file()));
-                }
+                  if (evaluator != null) {
+                    entries =
+                        CloseableIterable.filter(
+                            entries, entry -> evaluator.eval((GenericDataFile) entry.file()));
+                  }
 
-                entries =
-                    CloseableIterable.filter(
-                        scanMetrics.skippedDataFiles(), entries, manifestEntryPredicate);
+                  entries = CloseableIterable.filter(entries, manifestEntryPredicate);
+                }
 
                 iterable = entryFn.apply(manifest, entries);
-
                 return iterable.iterator();
               }
 

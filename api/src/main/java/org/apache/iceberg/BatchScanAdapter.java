@@ -140,4 +140,14 @@ class BatchScanAdapter implements BatchScan {
   public long splitOpenFileCost() {
     return scan.splitOpenFileCost();
   }
+
+  @Override
+  public BatchScan streaming(boolean streaming) {
+    return new BatchScanAdapter(scan.streaming(streaming));
+  }
+
+  @Override
+  public boolean isStreaming() {
+    return scan.isStreaming();
+  }
 }

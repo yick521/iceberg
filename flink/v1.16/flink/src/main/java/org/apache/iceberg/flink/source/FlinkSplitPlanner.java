@@ -83,8 +83,8 @@ public class FlinkSplitPlanner {
       Table table, ScanContext context, ExecutorService workerPool) {
     ScanMode scanMode = checkScanMode(context);
     if (scanMode == ScanMode.INCREMENTAL_APPEND_SCAN) {
-      IncrementalAppendScan scan = table.newIncrementalAppendScan();
-      scan = refineScanWithBaseConfigs(scan, context, workerPool);
+      IncrementalAppendScan scan =
+          refineScanWithBaseConfigs(table.newIncrementalAppendScan(), context, workerPool);
 
       if (context.startSnapshotId() != null) {
         scan = scan.fromSnapshotExclusive(context.startSnapshotId());
@@ -95,33 +95,49 @@ public class FlinkSplitPlanner {
       }
 
       return scan.planTasks();
-    } else {
-      TableScan scan = table.newScan();
-      scan = refineScanWithBaseConfigs(scan, context, workerPool);
+    } else if (scanMode == ScanMode.CHANGELOG) {
 
-      if (context.snapshotId() != null) {
-        scan = scan.useSnapshot(context.snapshotId());
+      TableScan scan =
+          setSnapshotId(context, refineScanWithBaseConfigs(table.newScan(), context, workerPool));
+
+      if (context.isStreaming()) {
+        scan = scan.streaming(true);
       }
 
-      if (context.asOfTimestamp() != null) {
-        scan = scan.asOfTime(context.asOfTimestamp());
+      if (context.startSnapshotId() != null) {
+        if (context.endSnapshotId() != null) {
+          scan = scan.appendsBetween(context.startSnapshotId(), context.endSnapshotId());
+        } else {
+          scan = scan.appendsAfter(context.startSnapshotId());
+        }
       }
 
       return scan.planTasks();
+    } else {
+      return setSnapshotId(context, refineScanWithBaseConfigs(table.newScan(), context, workerPool))
+          .planTasks();
     }
   }
 
-  private enum ScanMode {
-    BATCH,
-    INCREMENTAL_APPEND_SCAN
+  private static TableScan setSnapshotId(ScanContext context, TableScan scan) {
+    if (context.snapshotId() != null) {
+      scan.useSnapshot(context.snapshotId());
+    }
+
+    if (context.asOfTimestamp() != null) {
+      scan.asOfTime(context.asOfTimestamp());
+    }
+    return scan;
   }
 
   private static ScanMode checkScanMode(ScanContext context) {
     if (context.isStreaming()
         || context.startSnapshotId() != null
         || context.endSnapshotId() != null) {
-      return ScanMode.INCREMENTAL_APPEND_SCAN;
+      return ScanMode.CHANGELOG;
     } else {
+      // 什么时候才是append?
+      // else if(context.isStreaming() || ???? )
       return ScanMode.BATCH;
     }
   }
@@ -158,5 +174,11 @@ public class FlinkSplitPlanner {
     }
 
     return refinedScan;
+  }
+
+  private enum ScanMode {
+    BATCH,
+    CHANGELOG,
+    INCREMENTAL_APPEND_SCAN
   }
 }

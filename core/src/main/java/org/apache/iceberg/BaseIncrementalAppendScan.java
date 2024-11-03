@@ -111,7 +111,9 @@ class BaseIncrementalAppendScan
     for (Snapshot snapshot :
         SnapshotUtil.ancestorsBetween(
             toSnapshotIdInclusive, fromSnapshotIdExclusive, table::snapshot)) {
-      if (snapshot.operation().equals(DataOperations.APPEND)) {
+      if (snapshot.operation().equals(DataOperations.APPEND) ||
+              snapshot.operation().equals(DataOperations.OVERWRITE) ||
+              snapshot.operation().equals(DataOperations.DELETE)) {
         snapshots.add(snapshot);
       }
     }

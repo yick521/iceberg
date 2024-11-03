@@ -231,4 +231,15 @@ abstract class BaseScan<ThisT, T extends ScanTask, G extends ScanTaskGroup<T>>
 
     return schema;
   }
+
+  @Override
+  public ThisT streaming(boolean streaming) {
+    return newRefinedScan(
+            ops, table, schema, context.setStreaming(streaming));
+  }
+
+  @Override
+  public boolean isStreaming() {
+    return context.streaming();
+  }
 }

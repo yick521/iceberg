@@ -1,5 +1,14 @@
 acceptedBreaks:
   "1.0.0":
+    org.apache.iceberg:iceberg-api:
+    - code: "java.method.addedToInterface"
+      new: "method ThisT org.apache.iceberg.Scan<ThisT, T extends org.apache.iceberg.ScanTask,\
+        \ G extends org.apache.iceberg.ScanTaskGroup<T extends org.apache.iceberg.ScanTask>>::streaming(boolean)"
+      justification: "Acceptable API changes"
+    - code: "java.method.addedToInterface"
+      new: "method boolean org.apache.iceberg.Scan<ThisT, T extends org.apache.iceberg.ScanTask,\
+        \ G extends org.apache.iceberg.ScanTaskGroup<T extends org.apache.iceberg.ScanTask>>::isStreaming()"
+      justification: "Acceptable API changes"
     org.apache.iceberg:iceberg-core:
     - code: "java.class.defaultSerializationChanged"
       old: "class org.apache.iceberg.BaseMetadataTable"
